@@ -3,7 +3,7 @@ import math
 import torch
 import torch.distributed as dist
 import numpy as np
-from tqdm import tqdm
+from tqdm import tqdm, trange
 from models import mar
 from models.vae import AutoencoderKL
 from torchvision.utils import save_image
@@ -26,17 +26,19 @@ def main(args):
   seed = args.global_seed * dist.get_world_size() + rank
   l.seed_everything(seed)  
   torch.cuda.set_device(device)
-  print(f"Start with the rank:{rank}, device:{device}, seed:{seed}, world_size:{dist.get_world_size()}")
+  if rank == 0:
+    print(f"Start with the rank:{rank}, device:{device}, seed:{seed}, world_size:{dist.get_world_size()}")
 
   if args.tf32:
     tf32 = True
     torch.backends.cudnn.allow_tf32 = bool(tf32)
     torch.backends.cuda.matmul.allow_tf32 = bool(tf32)
     torch.set_float32_matmul_precision('high' if tf32 else 'highest')
-    print(f"Fast inference mode is enabled🏎️🏎️🏎️. TF32: {tf32}")
+    if rank == 0:
+      print(f"Fast inference mode is enabled🏎️🏎️🏎️. TF32: {tf32}")
   else:
-    print("Fast inference mode is disabled🐢🐢🐢, you may enable it by passing the '--fast-inference' flag!")
-  l.seed_everything(args.seed)
+    if rank == 0:
+      print("Fast inference mode is disabled🐢🐢🐢, you may enable it by passing the '--fast-inference' flag!")
   if args.model_type == "mar_base":
     download.download_pretrained_marb(overwrite=False)
     diffloss_d = 6
@@ -76,30 +78,33 @@ def main(args):
   total_samples_per_class = int(math.ceil(args.samples_per_class / global_batch_size) * global_batch_size)
   if rank == 0:
     print(f"Total samples per class: {total_samples_per_class}")
-  samples_per_single_gpu = total_samples_per_class // n
-  pbar = range(samples_per_single_gpu)
-  pbar = tqdm(pbar) if rank == 0  else pbar
+  samples_per_single_gpu = total_samples_per_class // dist.get_world_size()
+  iteration = total_samples_per_class // global_batch_size
+  if rank == 0:
+    print(f"Each GPU is going to sample {samples_per_single_gpu} number of images")
+  pbar = range(iteration)
   with torch.cuda.amp.autocast():
-    for i in (args.num_classes):
+    for i in trange(args.num_classes):
       for j in pbar:
         sampled_tokens = model.sample_tokens(
-        bsz=args.batch_size, num_iter=args.num_ar_steps,
+        bsz=args.per_proc_batch_size, num_iter=args.num_ar_steps,
         cfg=args.cfg_scale, cfg_schedule=args.cfg_schedule,
-        labels=torch.full((args.batch_size,), i, dtype=torch.long, device="cuda"),
+        labels=torch.full((args.per_proc_batch_size,), i, dtype=torch.long, device="cuda"),
         temperature=args.temperature, progress=False)
         sampled_images = vae.decode(sampled_tokens / 0.2325)
         # save the images into the folder
-        for k in range(global_batch_size):
+        for k in range(args.per_proc_batch_size):
             index = k * dist.get_world_size() + rank + total_generated_samples
             save_image(sampled_images[k], os.path.join(save_path, f"{index:6d}.png"), normalize=True, value_range=(-1, 1))
         total_generated_samples += global_batch_size
+        # print(f"total generated samples until this moment: {total_generated_samples}")
 
   dist.barrier()
   dist.destroy_process_group() 
 
 
 if __name__ == "__main__":
-  parser = argparse.ArgumentParser(descrioption="Generate ImageNet images by using a single GPU.")
+  parser = argparse.ArgumentParser()
   parser.add_argument("--model-type", type=str, default="mar_huge", choices=["mar_base", "mar_large", "mar_huge"], help="The model type to use.")
   parser.add_argument("--num-sampling-steps-diffloss", type=int, default=115, help="The number of sampling steps for the diffloss.")
   parser.add_argument("--global-seed", type=int, default=0, help="The random seed")
